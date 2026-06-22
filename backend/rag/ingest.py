@@ -53,13 +53,17 @@
 #             print(f"[{r['score']}] chunk {r['chunk_id']}- {r['text']}")
 
 
+#  DAY 3
+
 from pathlib import Path
 from pypdf import PdfReader
-from chunker import clean_text, chunk_text, build_chunk_records, Chunk
-from retriever import ChromaRetriever
+
+from chunker import clean_text, chunk_text, build_chunk_records
+
+from retriever import HybridRetriever, ChromaRetriever
 
 
-def load_pdf(path: Path) -> str:
+def load_path(path: Path) -> str:
     reader = PdfReader(path)
     pages = []
 
@@ -68,122 +72,76 @@ def load_pdf(path: Path) -> str:
         if text:
             pages.append(text)
         else:
-            print(f"page {i + 1} returned no text")
+            print(f"[WARN] page {i + 1} has no text")
+
     return "\n".join(pages)
 
 
 def ingest(
     pdf_path: Path, chunk_size: int = 500, overlap: int = 100
-) -> tuple[list[Chunk], ChromaRetriever]:
-    """Full ingestion: PDF->clean->chunk->embed->chromaDB"""
-    print(f"\nLoading {pdf_path.name}...")
-    raw = load_pdf(pdf_path)
-
-    print("Cleaning text...")
+) -> HybridRetriever:
+    print(f"\nLoading {pdf_path.name}")
+    raw = load_path(pdf_path)
+    print("Cleaning...")
     cleaned = clean_text(raw)
-    print(f"{len(cleaned):,} characters")
-
-    print("Chunking...")
+    print(f"{len(cleaned):} characters")
     chunks = chunk_text(cleaned, chunk_size=chunk_size, overlap=overlap)
     print(f"{len(chunks)} chunks")
-
     records = build_chunk_records(chunks, source=pdf_path.name)
-
-    print("Fitting ChromaReriever...")
-    retriever = ChromaRetriever()
+    print("\n Fitting HybridRetriever")
+    retriever = HybridRetriever()
     retriever.fit(records)
-
-    return records, retriever
+    return retriever
 
 
 if __name__ == "__main__":
     pdf_path = Path("data/samplerag.pdf")
 
     if not pdf_path.exists():
-        print(f"{pdf_path} not found. Put your PDF in the data folder.")
+        print(f"ERROR {pdf_path} not found")
 
-    records, retriever = ingest(pdf_path)
-
-    # test 1
-    test_queries = [
-        "What is RAG?",
-        "What is a vector database?",
-        "What are the limitations of RAG?",
+    hybrid = ingest(pdf_path)
+    test_cases = [
+        {
+            "query": "What is RAG?",
+            "note": "Semantic query : both methods should do well",
+        },
+        {
+            "query": "What is Top k retrieval",
+            "note": "Exact keyword query : Top k should contribute strongly",
+        },
+        {
+            "query": "Differences between RAG and Fine Tuning",
+            "note": "Conceptual query — dense should contribute strongly",
+        },
     ]
 
-    print("----------------------------------")
-    print("basic retrieval")
-    print("----------------------------------")
+    dense_only = ChromaRetriever()
 
-    for query in test_queries:
-        print(f"\nQuery: {query}")
-        results = retriever.search(query, top_k=3)
-        for r in results:
-            print(f"[{r['score']}] chunk {r['chunk_id']} → {r['text']}")
+    for case in test_cases:
+        query = case["query"]
+        note = case["note"]
 
-    # Test 2: persistence test
-    print("----------------------------------")
-    print("Persistence:second instance should skip embedding")
-    print("----------------------------------")
+        print(f"{query}\n")
+        print(f"{note}")
 
-    retriever2 = ChromaRetriever()
-    retriever2.fit(records)
-    print(f"retriever2 chunk count:{retriever2.count()}")
-    r1 = retriever.search("What is RAG?", top_k=3)
-    r2 = retriever2.search("What is RAG?", top_k=3)
-    ids_match = [x["chunk_id"] for x in r1] == [x["chunk_id"] for x in r2]
-    print(f"Results match between instances:{ids_match}")
+        print("\nDense only (ChromaDB)")
+        dense_results = dense_only.search(query, top_k=3)
+        for r in dense_results:
+            print(f"score={r['score']},chunk {r['chunk_id']} {r['text']}...")
 
-    # Test 3: update simulation
-    print("----------------------------------")
-    print("Update: simulate document content change")
-    print("----------------------------------")
+        print("\nHybrid (BM25 + ChromaDB + RRF)")
+        hybrid_results = hybrid.search(query, top_k=3)
+        for r in hybrid_results:
+            print(f"rrf={r['rrf_score']},chunk {r['chunk_id']}{r['text']}...")
+        dense_ids = {r["chunk_id"] for r in dense_results}
+        hybrid_ids = {r["chunk_id"] for r in hybrid_results}
+        overlap_ids = dense_ids & hybrid_ids
+        unique_to_hybrid = hybrid_ids - dense_ids
 
-    count_before = retriever.count()
-    print(f"Chunks before update: {count_before}")
-    from chunker import Chunk
-    import dataclasses
-
-    modified_records = []
-    for i, record in enumerate(records):
-        if i < 2:
-            modified = dataclasses.replace(
-                record, text=f"[UPDATED CONTENT] {record.text}"
+        print(f"\n  Overlap with dense: {len(overlap_ids)}/3 chunks")
+        if unique_to_hybrid:
+            print(
+                f"  Unique to hybrid (BM25 contribution):"
+                f"chunks {sorted(unique_to_hybrid)}"
             )
-            modified_records.append(modified)
-        else:
-            modified_records.append(record)
-
-    print("Re-fitting with 2 modified chunks")
-    retriever.fit(modified_records)
-
-    count_after = retriever.count()
-    print(f"Chunks after update: {count_after}")
-    print(f"Count unchanged (same number of chunks):{count_before == count_after}")
-
-    updated_results = retriever.search("[UPDATED CONTENT]", top_k=2)
-    found_updated = any("[UPDATED CONTENT]" in r["text"] for r in updated_results)
-    print(f"Updated content is now searchable: {found_updated}")
-
-    # Test 4: metadata filter test
-    print("----------------------------------")
-    print("Metadata filter: source_filter restricts results")
-    print("----------------------------------")
-
-    # Searching with correct source filter
-    results_filtered = retriever.search(
-        "What is RAG?",
-        top_k=3,
-        source_filter=pdf_path.name,
-    )
-    print(f"  Results with source_filter='{pdf_path.name}': {len(results_filtered)}")
-    all_correct_source = all(r["source"] == pdf_path.name for r in results_filtered)
-    print(f"All results from correct source: {all_correct_source}")
-
-    # Searching with a non-existent source
-    results_wrong = retriever.search(
-        "What is RAG?",
-        top_k=3,
-        source_filter="nonexistent.pdf",
-    )
-    print(f"Results with wrong source_filter: {len(results_wrong)}")
